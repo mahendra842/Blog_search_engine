@@ -1,0 +1,209 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from src.blog_scraper import BlogScraper
+from src.content_analyzer import ContentAnalyzer
+from src.models.blog_post import BlogPost, db
+from flask import Flask
+import logging
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class BlogIndexer:
+    def __init__(self, app=None):
+        self.scraper = BlogScraper(delay=2.0)  # 2 second delay between requests
+        self.analyzer = ContentAnalyzer()
+        self.app = app
+        
+    def index_from_directory(self, directory_url, max_blogs=20):
+        """
+        Index blogs from a directory
+        """
+        logging.info(f"Starting to index blogs from directory: {directory_url}")
+        
+        # Get blog URLs from directory
+        blog_urls = self.scraper.scrape_blog_directory(directory_url, max_blogs)
+        logging.info(f"Found {len(blog_urls)} potential blog URLs")
+        
+        indexed_count = 0
+        
+        for blog_url in blog_urls:
+            try:
+                # Try to find RSS feeds first
+                rss_feeds = self.scraper.discover_rss_feeds(blog_url)
+                
+                if rss_feeds:
+                    # Index from RSS feed
+                    for feed_url in rss_feeds[:1]:  # Use first RSS feed found
+                        posts = self.scraper.scrape_rss_feed(feed_url, max_posts=5)
+                        for post_data in posts:
+                            if self._index_post(post_data):
+                                indexed_count += 1
+                else:
+                    # Try to scrape the blog URL directly
+                    post_data = self.scraper.scrape_blog_post(blog_url)
+                    if post_data and self._index_post(post_data):
+                        indexed_count += 1
+                        
+            except Exception as e:
+                logging.error(f"Error processing blog {blog_url}: {e}")
+                continue
+        
+        logging.info(f"Successfully indexed {indexed_count} posts")
+        return indexed_count
+    
+    def index_from_rss_feed(self, feed_url, max_posts=10):
+        """
+        Index posts from a specific RSS feed
+        """
+        logging.info(f"Indexing posts from RSS feed: {feed_url}")
+        
+        posts = self.scraper.scrape_rss_feed(feed_url, max_posts)
+        indexed_count = 0
+        
+        for post_data in posts:
+            if self._index_post(post_data):
+                indexed_count += 1
+        
+        logging.info(f"Indexed {indexed_count} posts from RSS feed")
+        return indexed_count
+    
+    def index_single_post(self, url):
+        """
+        Index a single blog post
+        """
+        logging.info(f"Indexing single post: {url}")
+        
+        post_data = self.scraper.scrape_blog_post(url)
+        if post_data and self._index_post(post_data):
+            logging.info("Successfully indexed post")
+            return True
+        else:
+            logging.error("Failed to index post")
+            return False
+    
+    def _index_post(self, post_data):
+        """
+        Process and index a single post
+        """
+        try:
+            with self.app.app_context():
+                # Check if post already exists
+                existing_post = BlogPost.query.filter_by(url=post_data["url"]).first()
+                if existing_post:
+                    logging.info(f"Post already exists: {post_data['url']}")
+                    return False
+                
+                # Validate required fields
+                if not post_data.get("title") or not post_data.get("content") or not post_data.get("url"):
+                    logging.warning(f"Missing required fields for post: {post_data.get('url', 'Unknown URL')}")
+                    return False
+                
+                # Ensure content is substantial
+                if len(post_data["content"].split()) < 50:
+                    logging.warning(f"Content too short for post: {post_data['url']}")
+                    return False
+                
+                # Analyze content
+                analysis = self.analyzer.analyze_content(
+                    post_data["title"],
+                    post_data["content"],
+                    post_data["url"],
+                    post_data.get("author")
+                )
+                
+                # Only index if it meets quality thresholds
+                if analysis["authenticity_score"] < 0.3:
+                    logging.info(f"Post quality too low (score: {analysis['authenticity_score']:.2f}): {post_data['url']}")
+                    return False
+                
+                if analysis["ai_generated_probability"] > 0.7:
+                    logging.info(f"Post likely AI-generated (prob: {analysis['ai_generated_probability']:.2f}): {post_data['url']}")
+                    return False
+                
+                # Create blog post record
+                blog_post = BlogPost(
+                    title=post_data["title"],
+                    content=post_data["content"],
+                    url=post_data["url"],
+                    author=post_data.get("author"),
+                    published_date=post_data.get("published_date"),
+                    blog_domain=analysis["blog_domain"],
+                    blog_name=post_data.get("blog_name"),
+                    keywords=analysis["keywords"],
+                    summary=analysis["summary"],
+                    authenticity_score=analysis["authenticity_score"],
+                    ai_generated_probability=analysis["ai_generated_probability"],
+                    vocabulary_richness=analysis["vocabulary_richness"],
+                    sentence_complexity=analysis["sentence_complexity"],
+                    is_personal_blog=analysis["is_personal_blog"]
+                )
+                
+                # Save to database
+                db.session.add(blog_post)
+                db.session.commit()
+                
+                logging.info(f"Successfully indexed: {post_data['title']} (score: {analysis['authenticity_score']:.2f})")
+                return True
+            
+        except Exception as e:
+            logging.error(f"Error indexing post {post_data.get('url', 'Unknown')}: {e}")
+            return False
+
+def create_app():
+    """Create Flask app for database operations"""
+    app = Flask(__name__)
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL",
+    f"sqlite:///{os.path.join(os.path.dirname(__file__), 'database', 'app.db')}"
+)
+
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    db.init_app(app)
+    
+    with app.app_context():
+        db.create_all()
+    
+    return app
+
+def main():
+    """Main function for testing the indexer"""
+    app = create_app()
+    indexer = BlogIndexer(app)
+    
+    # Test with some known personal blog directories and feeds
+    test_sources = [
+        # Personal blog examples (these are real blogs mentioned in the problem statement)
+        "https://manassaloi.com",
+        "https://waitbutwhy.com",
+    ]
+    
+    # Add RSS feeds from the generated list
+    try:
+        with open("rss_feed_urls.txt", "r") as f:
+            for line in f:
+                test_sources.append(line.strip())
+    except FileNotFoundError:
+        logging.warning("rss_feed_urls.txt not found. Proceeding with default sources.")
+
+    for source in test_sources:
+        try:
+            if source.endswith(".xml") or "feed" in source or "rss" in source:
+                indexer.index_from_rss_feed(source)
+            else:
+                # Try to index as a single post or discover feeds
+                rss_feeds = indexer.scraper.discover_rss_feeds(source)
+                if rss_feeds:
+                    indexer.index_from_rss_feed(rss_feeds[0], max_posts=3)
+                else:
+                    indexer.index_single_post(source)
+        except Exception as e:
+            logging.error(f"Error processing {source}: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
